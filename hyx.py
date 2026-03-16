@@ -498,9 +498,26 @@ def train_epoch(model, loader, optimizer, criterion, device):
     all_preds = []
     all_targets = []
     
-    # 创建tqdm进度条
-    pbar = tqdm(loader, desc="Training", leave=False)
+
+# 强制标准输出无缓冲
+    import sys
+    import os
+    sys.stdout.reconfigure(line_buffering=True)  # Python 3.7+
     
+    # 或者使用这个（兼容所有版本）
+    # sys.stdout = open(sys.stdout.fileno(), 'w', buffering=1)
+    
+    # 创建tqdm进度条，强制刷新
+    pbar = tqdm(
+        loader, 
+        desc="Training", 
+        leave=False,
+        mininterval=3.0,  # 最小更新间隔0.1秒
+        maxinterval=15.0,  # 最大更新间隔1秒
+        dynamic_ncols=True
+    )
+
+
     for data in pbar:
         data = data.to(device)
         optimizer.zero_grad()
