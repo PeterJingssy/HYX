@@ -585,8 +585,7 @@ if __name__ == "__main__":
     # 使用绝对路径并确保是原始字符串
     root_path = "/home/jingyj/HYX/ZINC"
 
-    # 使用绝对路径并确保是原始字符串
-    root_path = "/home/jingyj/HYX/ZINC"
+
     train_dataset = ZINC(root=root_path, subset=True, split='train')
     val_dataset = ZINC(root=root_path, subset=True, split='val')
     test_dataset = ZINC(root=root_path, subset=True, split='test')
@@ -646,10 +645,6 @@ if __name__ == "__main__":
     # 训练循环
     best_val_mse = float('inf')
     print("Starting training...")
-    for epoch in range(1, 2):
-        train_mse, train_mae, train_rmse, train_r2 = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_mse, val_mae, val_rmse, val_r2 = eval_epoch(model, val_loader, criterion, device)
-
     # 添加epoch级别的进度条f
     for epoch in tqdm(range(1, 51), desc="Epochs"):
         train_mse, train_mae, train_rmse, train_r2 = train_epoch(model, train_loader, optimizer, criterion, device)
