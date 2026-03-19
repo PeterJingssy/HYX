@@ -1,3 +1,5 @@
+#FUSE 上conda Jing 环境
+
 import torch
 print("GPU 是否可用:", torch.cuda.is_available())
 print("当前显卡:", torch.cuda.get_device_name(0))

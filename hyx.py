@@ -511,7 +511,7 @@ def train_epoch(model, loader, optimizer, criterion, device):
     pbar = tqdm(
         loader, 
         desc="Training", 
-        leave=False,
+        file=sys.stderr,   # ⭐关键
         mininterval=3.0,  # 最小更新间隔0.1秒
         maxinterval=15.0,  # 最大更新间隔1秒
         dynamic_ncols=True
@@ -533,7 +533,7 @@ def train_epoch(model, loader, optimizer, criterion, device):
         # 实时更新进度条显示当前loss
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
-            'avg_loss': f'{total_loss/(len(all_preds)*128):.4f}'
+            'avg_loss': f'{total_loss / sum([t.size(0) for t in all_targets]):.4f}'
         })
     
     # 计算指标
@@ -614,21 +614,21 @@ if __name__ == "__main__":
         edge_in_channels = None
 
     # ================== 配置选项 ==================
-    use_dynamic = True          # True: 动态曲率, False: 静态曲率
+    use_dynamic = False         # True: 动态曲率, False: 静态曲率
     use_edge = True             # 是否使用化学键特征
     beta = 1.0                  # 温度参数 (论文公式4.1)
     use_sinkhorn = True         # 是否使用Sinkhorn
-    lambda_reg = 0.1            # Sinkhorn正则化系数
+    lambda_reg = 0.05            # Sinkhorn正则化系数
     sinkhorn_iters = 10         # Sinkhorn迭代次数
     # =============================================
 
     # 初始化模型
     model = Curvphormer(
         in_channels=in_channels,
-        hidden_dim=64,
+        hidden_dim=128,
         out_channels=1,
         num_layers=4,
-        num_heads=4,
+        num_heads=8,
         dropout=0.1,
         use_dynamic_curvature=use_dynamic,
         edge_in_channels=edge_in_channels if use_edge else None,
