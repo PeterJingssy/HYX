@@ -1,0 +1,7 @@
+this_is_a_outcome_of_change_parasb5s00510
+Using device: cuda
+Warning: edge_attr is 1D, treating as scalar feature.
+Starting training...
+  Batch 0 done, loss: 4.1010
+  Batch 1 done, loss: 3.2055
+slurmstepd-fuse2: error: *** STEP 39170.0 ON fuse2 CANCELLED AT 2026-03-22T00:41:41 ***

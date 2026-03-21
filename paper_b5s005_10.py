@@ -11,8 +11,14 @@ import torch.optim as optim
 from sklearn.metrics import r2_score
 from tqdm import tqdm
 import warnings
-
+import sys
+import os
 warnings.filterwarnings('ignore')
+
+# ==================== 全局无缓冲输出配置（核心修改） ====================
+# 强制标准输出/错误无缓冲，确保print实时写入日志
+sys.stdout = open(sys.stdout.fileno(), 'w', buffering=1)  # 行缓冲（兼容所有Python版本）
+sys.stderr = open(sys.stderr.fileno(), 'w', buffering=1)  # tqdm默认输出到stderr，也要配置
 
 # ------------------- 模块1：离散Ricci曲率计算（静态，修正版） -------------------
 class DiscreteRicciCurvature:
@@ -438,14 +444,24 @@ class Curvphormer(nn.Module):
         return out
 
 
-"""
-
-# ------------------- 训练/评估函数（支持多指标） -------------------
+# ------------------- 训练/评估函数（支持多指标+实时进度） -------------------
 def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
     all_preds = []
     all_targets = []
+    
+    # 创建tqdm进度条，强制输出到stderr并实时刷新
+    pbar = tqdm(
+        loader, 
+        desc="Training", 
+        file=sys.stderr,   # 关键：tqdm输出到stderr（已配置无缓冲）
+        mininterval=0.1,  # 最小更新间隔0.1秒
+        maxinterval=1.0,  # 最大更新间隔1秒
+        dynamic_ncols=True,
+        leave=True
+    )
+
     for batch_idx, data in enumerate(loader):
         data = data.to(device)
         optimizer.zero_grad()
@@ -456,86 +472,16 @@ def train_epoch(model, loader, optimizer, criterion, device):
         total_loss += loss.item() * data.num_graphs
         all_preds.append(out.detach().cpu())
         all_targets.append(data.y.cpu())
-
         # 每 10 个 batch 打印一次进度（可根据需要调整频率）
-        if batch_idx % 10 == 0:
+        if batch_idx % 1 == 0:
             print(f'  Batch {batch_idx} done, loss: {loss.item():.4f}')
 
-    # 计算各项指标
-    all_preds = torch.cat(all_preds)
-    all_targets = torch.cat(all_targets)
-    mse = total_loss / len(loader.dataset)
-    mae = torch.mean(torch.abs(all_preds - all_targets)).item()
-    rmse = torch.sqrt(torch.mean((all_preds - all_targets) ** 2)).item()
-    r2 = r2_score(all_targets.numpy(), all_preds.numpy())
-    return mse, mae, rmse, r2
-
-
-@torch.no_grad()
-def eval_epoch(model, loader, criterion, device):
-    model.eval()
-    total_loss = 0
-    all_preds = []
-    all_targets = []
-    for data in loader:
-        data = data.to(device)
-        out = model(data).squeeze()
-        loss = criterion(out, data.y)
-        total_loss += loss.item() * data.num_graphs
-        all_preds.append(out.cpu())
-        all_targets.append(data.y.cpu())
-    all_preds = torch.cat(all_preds)
-    all_targets = torch.cat(all_targets)
-    mse = total_loss / len(loader.dataset)
-    mae = torch.mean(torch.abs(all_preds - all_targets)).item()
-    rmse = torch.sqrt(torch.mean((all_preds - all_targets) ** 2)).item()
-    r2 = r2_score(all_targets.numpy(), all_preds.numpy())
-    return mse, mae, rmse, r2
-"""
-
-def train_epoch(model, loader, optimizer, criterion, device):
-    model.train()
-    total_loss = 0
-    all_preds = []
-    all_targets = []
-    
-
-# 强制标准输出无缓冲
-    import sys
-    import os
-    sys.stdout.reconfigure(line_buffering=True)  # Python 3.7+
-    
-    # 或者使用这个（兼容所有版本）
-    # sys.stdout = open(sys.stdout.fileno(), 'w', buffering=1)
-    
-    # 创建tqdm进度条，强制刷新
-    pbar = tqdm(
-        loader, 
-        desc="Training", 
-        file=sys.stderr,   # ⭐关键
-        mininterval=3.0,  # 最小更新间隔0.1秒
-        maxinterval=15.0,  # 最大更新间隔1秒
-        dynamic_ncols=True
-    )
-
-
-    for data in pbar:
-        data = data.to(device)
-        optimizer.zero_grad()
-        out = model(data).squeeze()
-        loss = criterion(out, data.y)
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item() * data.num_graphs
-        all_preds.append(out.detach().cpu())
-        all_targets.append(data.y.cpu())
-        
         # 实时更新进度条显示当前loss
+        current_avg_loss = total_loss / sum([t.size(0) for t in all_targets]) if all_targets else 0.0
         pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'avg_loss': f'{total_loss / sum([t.size(0) for t in all_targets]):.4f}'
-        })
+            'batch_loss': f'{loss.item():.4f}',
+            'avg_loss': f'{current_avg_loss:.4f}'
+        }, refresh=True)  # 强制刷新进度条
     
     # 计算指标
     all_preds = torch.cat(all_preds)
@@ -544,7 +490,6 @@ def train_epoch(model, loader, optimizer, criterion, device):
     mae = torch.mean(torch.abs(all_preds - all_targets)).item()
     rmse = torch.sqrt(torch.mean((all_preds - all_targets) ** 2)).item()
     r2 = r2_score(all_targets.numpy(), all_preds.numpy())
-    
     return mse, mae, rmse, r2
 
 @torch.no_grad()
@@ -554,19 +499,26 @@ def eval_epoch(model, loader, criterion, device):
     all_preds = []
     all_targets = []
     
-    # 验证集也可以用tqdm
-    pbar = tqdm(loader, desc="Validating", leave=False)
+    # 验证集进度条
+    pbar = tqdm(
+        loader, 
+        desc="Validating", 
+        file=sys.stderr,
+        mininterval=0.1,
+        maxinterval=1.0,
+        dynamic_ncols=True,
+        leave=False
+    )
     
-    for data in pbar:
+    for data in loader:
         data = data.to(device)
         out = model(data).squeeze()
         loss = criterion(out, data.y)
-        
         total_loss += loss.item() * data.num_graphs
         all_preds.append(out.cpu())
         all_targets.append(data.y.cpu())
         
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        pbar.set_postfix({'val_loss': f'{loss.item():.4f}'}, refresh=True)
     
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
@@ -579,19 +531,22 @@ def eval_epoch(model, loader, criterion, device):
 
 # ------------------- 主程序 -------------------
 if __name__ == "__main__":
+    # 打印任务标识（便于日志识别）
+    print("===== Curvphormer Training Start =====", flush=True)
+    
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Using device: {device}", flush=True)
 
-    # 使用绝对路径并确保是原始字符串
+    # 数据集路径（绝对路径）
     root_path = "/home/jingyj/HYX/ZINC"
+    print(f"Dataset root: {root_path}", flush=True)
 
-
+    # 加载数据集
     train_dataset = ZINC(root=root_path, subset=True, split='train')
     val_dataset = ZINC(root=root_path, subset=True, split='val')
     test_dataset = ZINC(root=root_path, subset=True, split='test')
 
-    
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
@@ -606,21 +561,31 @@ if __name__ == "__main__":
             edge_in_channels = sample_data.edge_attr.size(1)
         elif sample_data.edge_attr.dim() == 1:
             edge_in_channels = 1
-            print("Warning: edge_attr is 1D, treating as scalar feature.")
+            print("Warning: edge_attr is 1D, treating as scalar feature.", flush=True)
         else:
             edge_in_channels = None
-            print("Warning: edge_attr has unexpected shape, ignoring.")
+            print("Warning: edge_attr has unexpected shape, ignoring.", flush=True)
     else:
         edge_in_channels = None
 
     # ================== 配置选项 ==================
-    use_dynamic = False         # True: 动态曲率, False: 静态曲率
+    use_dynamic = True          # True: 动态曲率, False: 静态曲率
     use_edge = True             # 是否使用化学键特征
-    beta = 1.0                  # 温度参数 (论文公式4.1)
+    beta = 0.5                  # 温度参数 (论文公式4.1)
     use_sinkhorn = True         # 是否使用Sinkhorn
     lambda_reg = 0.05            # Sinkhorn正则化系数
     sinkhorn_iters = 10         # Sinkhorn迭代次数
     # =============================================
+
+    # 打印配置（便于日志回溯）
+    print("\n--- Training Configuration ---", flush=True)
+    print(f"use_dynamic_curvature: {use_dynamic}", flush=True)
+    print(f"use_edge_features: {use_edge}", flush=True)
+    print(f"beta: {beta}", flush=True)
+    print(f"use_sinkhorn: {use_sinkhorn}", flush=True)
+    print(f"lambda_reg: {lambda_reg}", flush=True)
+    print(f"sinkhorn_iters: {sinkhorn_iters}", flush=True)
+    print("------------------------------\n", flush=True)
 
     # 初始化模型
     model = Curvphormer(
@@ -642,28 +607,32 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     criterion = nn.MSELoss()
 
-
     # 训练循环
     best_val_mse = float('inf')
-    print("Starting training...")
-    # 添加epoch级别的进度条f
-    for epoch in tqdm(range(1, 51), desc="Epochs"):
+    print("Starting training...", flush=True)
+    
+    # Epoch级进度条
+    epoch_pbar = tqdm(range(1, 51), desc="Epochs", file=sys.stderr, dynamic_ncols=True)
+    for epoch in epoch_pbar:
         train_mse, train_mae, train_rmse, train_r2 = train_epoch(model, train_loader, optimizer, criterion, device)
         val_mse, val_mae, val_rmse, val_r2 = eval_epoch(model, val_loader, criterion, device)
 
-        print(f'Epoch {epoch:03d} | '
-              f'Train MSE: {train_mse:.4f} MAE: {train_mae:.4f} RMSE: {train_rmse:.4f} R2: {train_r2:.4f} | '
-              f'Val MSE: {val_mse:.4f} MAE: {val_mae:.4f} RMSE: {val_rmse:.4f} R2: {val_r2:.4f}')
+        # 打印epoch结果（强制flush）
+        log_str = (f'Epoch {epoch:03d} | '
+                   f'Train MSE: {train_mse:.4f} MAE: {train_mae:.4f} RMSE: {train_rmse:.4f} R2: {train_r2:.4f} | '
+                   f'Val MSE: {val_mse:.4f} MAE: {val_mae:.4f} RMSE: {val_rmse:.4f} R2: {val_r2:.4f}')
+        print(log_str, flush=True)
 
+        # 保存最佳模型
         if val_mse < best_val_mse:
             best_val_mse = val_mse
             torch.save(model.state_dict(), 'best_model.pth')
-            print(f'  -> Best model saved (val MSE: {val_mse:.4f})')
-
+            save_log = f'  -> Best model saved (val MSE: {val_mse:.4f})'
+            print(save_log, flush=True)
 
     # 加载最佳模型并在测试集上评估
     print("\nEvaluating on test set...")
-    model.load_state_dict(torch.load('best_model.pth'))
+    model.load_state_dict(torch.load('best_model_b5s005_10.pth'))
     test_mse, test_mae, test_rmse, test_r2 = eval_epoch(model, test_loader, criterion, device)
     print(f'Test MSE: {test_mse:.4f} MAE: {test_mae:.4f} RMSE: {test_rmse:.4f} R2: {test_r2:.4f}')
 
@@ -675,4 +644,4 @@ if __name__ == "__main__":
     print(f"use_sinkhorn: {use_sinkhorn}")
     print(f"lambda_reg: {lambda_reg}")
     print(f"sinkhorn_iters: {sinkhorn_iters}")
-
+    print("this_is_a_outcome_of_change_parasb5s00510")
