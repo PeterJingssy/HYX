@@ -3,7 +3,7 @@
 import torch
 print("GPU 是否可用:", torch.cuda.is_available())
 print("当前显卡:", torch.cuda.get_device_name(0))
-
+print("当前显卡:", torch.cuda.get_device_name(0))
 import sys
 import subprocess
 import importlib.metadata
