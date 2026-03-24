@@ -11,14 +11,7 @@ import torch.optim as optim
 from sklearn.metrics import r2_score
 from tqdm import tqdm
 import warnings
-import sys
-import os
 warnings.filterwarnings('ignore')
-
-# ==================== 全局无缓冲输出配置（核心修改） ====================
-# 强制标准输出/错误无缓冲，确保print实时写入日志
-sys.stdout = open(sys.stdout.fileno(), 'w', buffering=1)  # 行缓冲（兼容所有Python版本）
-sys.stderr = open(sys.stderr.fileno(), 'w', buffering=1)  # tqdm默认输出到stderr，也要配置
 
 # ------------------- 模块1：离散Ricci曲率计算（静态，修正版） -------------------
 class DiscreteRicciCurvature:
@@ -330,65 +323,76 @@ class Curvphormer(nn.Module):
                 curvature_values[i] = edge_curvatures_dict.get((v, u), 0.0)
         return curvature_values
 
-    def compute_dynamic_curvatures(self, h, edge_index):
-        """
-        动态曲率更新：基于当前节点特征h重新计算每条边的曲率
-        对应论文 4.3 节
-        h: [num_nodes, hidden_dim]
-        edge_index: [2, num_edges]
-        返回: [num_edges, hidden_dim] 新曲率嵌入
-        """
+    # ===== 修复后的动态曲率计算 =====
+    def compute_dynamic_curvatures(self, h, edge_index, chunk_size=512):
         device = h.device
         num_nodes = h.size(0)
         num_edges = edge_index.size(1)
 
-        # 构建邻居列表（包括自身）
-        neighbors = build_neighbor_list(edge_index, num_nodes, include_self=True)
+        # ===== 1. 构建 padded neighbors =====
+        nb_mat, mask = build_padded_neighbors(edge_index, num_nodes, device)
+        max_deg = nb_mat.size(1)
 
-        new_curvature_values = torch.zeros(num_edges, 1, device=device)
+        curvature_values = torch.zeros(num_edges, 1, device=device)
 
-        # 对每条边计算曲率
-        for e in range(num_edges):
-            i = edge_index[0][e].item()
-            j = edge_index[1][e].item()
+        for start in range(0, num_edges, chunk_size):
+            end = min(start + chunk_size, num_edges)
 
-            # 邻居索引
-            Ni = neighbors[i]  # [deg_i+1]
-            Nj = neighbors[j]  # [deg_j+1]
+            src = edge_index[0, start:end]  # [B]
+            tgt = edge_index[1, start:end]
 
-            # 特征矩阵
-            h_i_neighbors = h[Ni]  # [|Ni|, hidden_dim]
-            h_j_neighbors = h[Nj]  # [|Nj|, hidden_dim]
+            B = src.size(0)
 
-            # 计算分布 mu_i (基于相似度) —— 对应论文公式 (4.1)
-            sim_i = torch.mm(h[i].unsqueeze(0), h_i_neighbors.T).squeeze(0)  # [|Ni|]
-            mu_i = F.softmax(self.beta * sim_i, dim=0)  # [|Ni|]
+            # ===== 2. gather neighbors =====
+            src_nb = nb_mat[src]  # [B, max_deg]
+            tgt_nb = nb_mat[tgt]
 
-            # 计算分布 mu_j
-            sim_j = torch.mm(h[j].unsqueeze(0), h_j_neighbors.T).squeeze(0)
-            mu_j = F.softmax(self.beta * sim_j, dim=0)  # [|Nj|]
+            src_mask = mask[src]  # [B, max_deg]
+            tgt_mask = mask[tgt]
 
-            # 代价矩阵：特征L2距离 —— 对应论文公式 (4.2)
-            C = torch.cdist(h_i_neighbors, h_j_neighbors, p=2)  # [|Ni|, |Nj|]
+            # 避免 -1 index
+            src_nb_clamped = src_nb.clamp(min=0)
+            tgt_nb_clamped = tgt_nb.clamp(min=0)
 
-            if self.use_sinkhorn:
-                # 使用Sinkhorn计算Wasserstein距离
-                _, wass_dist = sinkhorn(mu_i, mu_j, C, lambda_reg=self.lambda_reg, num_iters=self.sinkhorn_iters)
-            else:
-                # 消融：不使用Sinkhorn，简单近似
-                wass_dist = torch.sum(torch.abs(mu_i[:, None] - mu_j[None, :]) * C)
+            h_src_nb = h[src_nb_clamped]  # [B, max_deg, d]
+            h_tgt_nb = h[tgt_nb_clamped]
 
-            # 边长度（动态长度）—— 对应论文公式 (4.4)
-            d_ij = torch.norm(h[i] - h[j], p=2)
-            d_ij = torch.clamp(d_ij, min=1e-6)
+            h_src_center = h[src]  # [B, d]
+            h_tgt_center = h[tgt]
 
-            # 曲率
-            kappa = 1 - wass_dist / d_ij
-            new_curvature_values[e] = kappa
+            # ===== 3. 相似度分布 =====
+            sim_src = (h_src_nb * h_src_center.unsqueeze(1)).sum(-1)  # [B, max_deg]
+            sim_tgt = (h_tgt_nb * h_tgt_center.unsqueeze(1)).sum(-1)
 
-        # 通过曲率编码器得到嵌入
-        curvature_embeddings = self.curvature_encoder(new_curvature_values)  # [num_edges, hidden_dim]
-        return curvature_embeddings
+            sim_src[~src_mask] = -1e9
+            sim_tgt[~tgt_mask] = -1e9
+
+            mu = F.softmax(self.beta * sim_src, dim=1)  # [B, m]
+            nu = F.softmax(self.beta * sim_tgt, dim=1)
+
+            # ===== 4. cost matrix =====
+            C = torch.cdist(h_src_nb, h_tgt_nb, p=2)  # [B, m, n]
+
+            # mask padding
+            mask_src = src_mask.unsqueeze(-1)  # [B, m, 1]
+            mask_tgt = tgt_mask.unsqueeze(1)  # [B, 1, n]
+            valid_mask = mask_src & mask_tgt
+            C = C.masked_fill(~valid_mask, 1e6)
+
+            # ===== 5. batched sinkhorn =====
+            wass = batched_sinkhorn(
+                mu, nu, C,
+                lambda_reg=self.lambda_reg,
+                num_iters=self.sinkhorn_iters
+            )  # [B]
+
+            # ===== 6. 边长度 =====
+            d_ij = torch.norm(h_src_center - h_tgt_center, dim=1).clamp(min=1e-6)
+
+            curvature = 1 - wass / d_ij
+            curvature_values[start:end, 0] = curvature
+
+        return self.curvature_encoder(curvature_values)
 
     def forward(self, data):
         x = data.x
@@ -443,45 +447,44 @@ class Curvphormer(nn.Module):
         out = self.output_layer(graph_out)
         return out
 
-
-# ------------------- 训练/评估函数（支持多指标+实时进度） -------------------
+# ------------------- 训练/评估函数（支持多指标） -------------------
 def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
     all_preds = []
     all_targets = []
     
-    # 创建tqdm进度条，强制输出到stderr并实时刷新
+    # 强制标准输出无缓冲
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+    
+    # 创建tqdm进度条
     pbar = tqdm(
         loader, 
         desc="Training", 
-        file=sys.stderr,   # 关键：tqdm输出到stderr（已配置无缓冲）
-        mininterval=0.1,  # 最小更新间隔0.1秒
-        maxinterval=1.0,  # 最大更新间隔1秒
-        dynamic_ncols=True,
-        leave=True
+        file=sys.stderr,
+        mininterval=3.0,
+        maxinterval=15.0,
+        dynamic_ncols=True
     )
 
-    for batch_idx, data in enumerate(loader):
+    for data in pbar:
         data = data.to(device)
         optimizer.zero_grad()
-        out = model(data).squeeze()  # [batch_size]
+        out = model(data).squeeze()
         loss = criterion(out, data.y)
         loss.backward()
         optimizer.step()
+        
         total_loss += loss.item() * data.num_graphs
         all_preds.append(out.detach().cpu())
         all_targets.append(data.y.cpu())
-        # 每 10 个 batch 打印一次进度（可根据需要调整频率）
-        if batch_idx % 1 == 0:
-            print(f'  Batch {batch_idx} done, loss: {loss.item():.4f}')
-
+        
         # 实时更新进度条显示当前loss
-        current_avg_loss = total_loss / sum([t.size(0) for t in all_targets]) if all_targets else 0.0
         pbar.set_postfix({
-            'batch_loss': f'{loss.item():.4f}',
-            'avg_loss': f'{current_avg_loss:.4f}'
-        }, refresh=True)  # 强制刷新进度条
+            'loss': f'{loss.item():.4f}',
+            'avg_loss': f'{total_loss / sum([t.size(0) for t in all_targets]):.4f}'
+        })
     
     # 计算指标
     all_preds = torch.cat(all_preds)
@@ -490,6 +493,7 @@ def train_epoch(model, loader, optimizer, criterion, device):
     mae = torch.mean(torch.abs(all_preds - all_targets)).item()
     rmse = torch.sqrt(torch.mean((all_preds - all_targets) ** 2)).item()
     r2 = r2_score(all_targets.numpy(), all_preds.numpy())
+    
     return mse, mae, rmse, r2
 
 @torch.no_grad()
@@ -499,26 +503,19 @@ def eval_epoch(model, loader, criterion, device):
     all_preds = []
     all_targets = []
     
-    # 验证集进度条
-    pbar = tqdm(
-        loader, 
-        desc="Validating", 
-        file=sys.stderr,
-        mininterval=0.1,
-        maxinterval=1.0,
-        dynamic_ncols=True,
-        leave=False
-    )
+    # 验证集也可以用tqdm
+    pbar = tqdm(loader, desc="Validating", leave=False)
     
-    for data in loader:
+    for data in pbar:
         data = data.to(device)
         out = model(data).squeeze()
         loss = criterion(out, data.y)
+        
         total_loss += loss.item() * data.num_graphs
         all_preds.append(out.cpu())
         all_targets.append(data.y.cpu())
         
-        pbar.set_postfix({'val_loss': f'{loss.item():.4f}'}, refresh=True)
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
     
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
@@ -529,20 +526,67 @@ def eval_epoch(model, loader, criterion, device):
     
     return mse, mae, rmse, r2
 
+
+# ------------------- gpt 新增padding等 -------------------
+
+def build_padded_neighbors(edge_index, num_nodes, device):
+    neighbors = [[] for _ in range(num_nodes)]
+    src = edge_index[0].cpu().numpy()
+    tgt = edge_index[1].cpu().numpy()
+
+    for u, v in zip(src, tgt):
+        neighbors[u].append(v)
+        neighbors[v].append(u)
+
+    for i in range(num_nodes):
+        neighbors[i].append(i)  # include self
+
+    max_deg = max(len(nb) for nb in neighbors)
+
+    nb_mat = torch.full((num_nodes, max_deg), -1, dtype=torch.long)
+    mask = torch.zeros((num_nodes, max_deg), dtype=torch.bool)
+
+    for i, nb in enumerate(neighbors):
+        nb = torch.tensor(nb, dtype=torch.long)
+        nb_mat[i, :len(nb)] = nb
+        mask[i, :len(nb)] = 1
+
+    return nb_mat.to(device), mask.to(device)
+
+
+def batched_sinkhorn(mu, nu, C, lambda_reg=0.1, num_iters=10):
+    """
+    mu: [B, m]
+    nu: [B, n]
+    C:  [B, m, n]
+    """
+    K = torch.exp(-lambda_reg * C).clamp(min=1e-12)
+
+    B, m, n = C.shape
+    u = torch.ones(B, m, device=C.device) / m
+    v = torch.ones(B, n, device=C.device) / n
+
+    for _ in range(num_iters):
+        u = mu / (torch.bmm(K, v.unsqueeze(-1)).squeeze(-1) + 1e-12)
+        v = nu / (torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1) + 1e-12)
+
+    P = u.unsqueeze(-1) * K * v.unsqueeze(1)
+    wass = torch.sum(P * C, dim=(1, 2))  # [B]
+
+    return wass
+
+
+
 # ------------------- 主程序 -------------------
 if __name__ == "__main__":
-    # 打印任务标识（便于日志识别）
-    print("===== Curvphormer Training Start =====", flush=True)
-    
+    print("this_is_a_outcome_provided_from_jyj_1st")
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}", flush=True)
+    print(f"Using device: {device}")
 
-    # 数据集路径（绝对路径）
-    root_path = "/home/jingyj/HYX/ZINC"
-    print(f"Dataset root: {root_path}", flush=True)
+    # 使用绝对路径并确保是原始字符串
+    root_path = r"./ZINC"
 
-    # 加载数据集
     train_dataset = ZINC(root=root_path, subset=True, split='train')
     val_dataset = ZINC(root=root_path, subset=True, split='val')
     test_dataset = ZINC(root=root_path, subset=True, split='test')
@@ -561,31 +605,21 @@ if __name__ == "__main__":
             edge_in_channels = sample_data.edge_attr.size(1)
         elif sample_data.edge_attr.dim() == 1:
             edge_in_channels = 1
-            print("Warning: edge_attr is 1D, treating as scalar feature.", flush=True)
+            print("Warning: edge_attr is 1D, treating as scalar feature.")
         else:
             edge_in_channels = None
-            print("Warning: edge_attr has unexpected shape, ignoring.", flush=True)
+            print("Warning: edge_attr has unexpected shape, ignoring.")
     else:
         edge_in_channels = None
 
     # ================== 配置选项 ==================
-    use_dynamic = True          # True: 动态曲率, False: 静态曲率
+    use_dynamic = True        # True: 动态曲率, False: 静态曲率
     use_edge = True             # 是否使用化学键特征
-    beta = 0.5                  # 温度参数 (论文公式4.1)
+    beta = 1.0                  # 温度参数 (论文公式4.1)
     use_sinkhorn = True         # 是否使用Sinkhorn
     lambda_reg = 0.05            # Sinkhorn正则化系数
     sinkhorn_iters = 10         # Sinkhorn迭代次数
     # =============================================
-
-    # 打印配置（便于日志回溯）
-    print("\n--- Training Configuration ---", flush=True)
-    print(f"use_dynamic_curvature: {use_dynamic}", flush=True)
-    print(f"use_edge_features: {use_edge}", flush=True)
-    print(f"beta: {beta}", flush=True)
-    print(f"use_sinkhorn: {use_sinkhorn}", flush=True)
-    print(f"lambda_reg: {lambda_reg}", flush=True)
-    print(f"sinkhorn_iters: {sinkhorn_iters}", flush=True)
-    print("------------------------------\n", flush=True)
 
     # 初始化模型
     model = Curvphormer(
@@ -609,30 +643,24 @@ if __name__ == "__main__":
 
     # 训练循环
     best_val_mse = float('inf')
-    print("Starting training...", flush=True)
-    
-    # Epoch级进度条
-    epoch_pbar = tqdm(range(1, 51), desc="Epochs", file=sys.stderr, dynamic_ncols=True)
-    for epoch in epoch_pbar:
+    print("Starting training...")
+    # 添加epoch级别的进度条
+    for epoch in tqdm(range(1, 51), desc="Epochs"):
         train_mse, train_mae, train_rmse, train_r2 = train_epoch(model, train_loader, optimizer, criterion, device)
         val_mse, val_mae, val_rmse, val_r2 = eval_epoch(model, val_loader, criterion, device)
 
-        # 打印epoch结果（强制flush）
-        log_str = (f'Epoch {epoch:03d} | '
-                   f'Train MSE: {train_mse:.4f} MAE: {train_mae:.4f} RMSE: {train_rmse:.4f} R2: {train_r2:.4f} | '
-                   f'Val MSE: {val_mse:.4f} MAE: {val_mae:.4f} RMSE: {val_rmse:.4f} R2: {val_r2:.4f}')
-        print(log_str, flush=True)
+        print(f'Epoch {epoch:03d} | '
+              f'Train MSE: {train_mse:.4f} MAE: {train_mae:.4f} RMSE: {train_rmse:.4f} R2: {train_r2:.4f} | '
+              f'Val MSE: {val_mse:.4f} MAE: {val_mae:.4f} RMSE: {val_rmse:.4f} R2: {val_r2:.4f}')
 
-        # 保存最佳模型
         if val_mse < best_val_mse:
             best_val_mse = val_mse
-            torch.save(model.state_dict(), 'best_model.pth')
-            save_log = f'  -> Best model saved (val MSE: {val_mse:.4f})'
-            print(save_log, flush=True)
+            torch.save(model.state_dict(), 'best_model_jyj.pth')
+            print(f'  -> Best model saved (val MSE: {val_mse:.4f})')
 
     # 加载最佳模型并在测试集上评估
     print("\nEvaluating on test set...")
-    model.load_state_dict(torch.load('best_model_b5s005_10.pth'))
+    model.load_state_dict(torch.load('best_model_jyj.pth'))
     test_mse, test_mae, test_rmse, test_r2 = eval_epoch(model, test_loader, criterion, device)
     print(f'Test MSE: {test_mse:.4f} MAE: {test_mae:.4f} RMSE: {test_rmse:.4f} R2: {test_r2:.4f}')
 
@@ -644,4 +672,3 @@ if __name__ == "__main__":
     print(f"use_sinkhorn: {use_sinkhorn}")
     print(f"lambda_reg: {lambda_reg}")
     print(f"sinkhorn_iters: {sinkhorn_iters}")
-    print("this_is_a_outcome_of_change_parasb5s00510")
